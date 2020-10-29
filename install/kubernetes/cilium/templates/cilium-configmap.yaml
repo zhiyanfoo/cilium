@@ -554,6 +554,9 @@ data:
 {{- if hasKey .Values.loadBalancer "dsrDispatch" }}
   bpf-lb-dsr-dispatch: {{ .Values.loadBalancer.dsrDispatch | quote }}
 {{- end }}
+{{- if hasKey .Values.loadBalancer "hostNamespaceOnly" }}
+  bpf-lb-sock-hostns-only: {{ .Values.loadBalancer.hostNamespaceOnly | quote }}
+{{- end }}
 
 {{- end }}
 {{- if hasKey .Values.maglev "tableSize" }}

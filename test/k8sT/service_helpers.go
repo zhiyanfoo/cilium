@@ -845,7 +845,10 @@ func testSessionAffinity(kubectl *helpers.Kubectl, ni *nodesInfo, fromOutside, v
 		err = kubectl.Get(helpers.DefaultNamespace, fmt.Sprintf("service %s", svcName)).Unmarshal(&data)
 		ExpectWithOffset(1, err).Should(BeNil(), "Cannot retrieve service %s", svcName)
 
-		httpURL := getHTTPLink(nodeIP, data.Spec.Ports[0].NodePort)
+		httpURL := getHTTPLink(data.Spec.ClusterIP, data.Spec.Ports[0].Port)
+		if fromOutside {
+			httpURL = getHTTPLink(nodeIP, data.Spec.Ports[0].NodePort)
+		}
 		cmd := helpers.CurlFail(httpURL) + " | grep 'Hostname:' " // pod name is in the hostname
 
 		if fromOutside {

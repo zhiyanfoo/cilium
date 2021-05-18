@@ -609,6 +609,24 @@ Secondary Interface %s :: IPv4: (%s, %s), IPv6: (%s, %s)`, helpers.DualStackSupp
 			})
 		})
 
+		// SA needs 4.19. However, on the 4.19 job we run KPR. So to test SA on
+		// bpf_lxc with kube-proxy we need to disable KRP.
+		SkipContextIf(helpers.DoesNotRunOn419Kernel, "Tests ClusterIP with sessionAffinity", func() {
+			BeforeAll(func() {
+				DeployCiliumOptionsAndDNS(kubectl, ciliumFilename, map[string]string{
+					"kubeProxyReplacement": "disabled",
+				})
+			})
+
+			AfterAll(func() {
+				DeployCiliumAndDNS(kubectl, ciliumFilename)
+			})
+
+			It("", func() {
+				testSessionAffinity(kubectl, ni, false, true)
+			})
+		})
+
 		SkipContextIf(helpers.RunsWithKubeProxyReplacement, "Tests NodePort (kube-proxy)", func() {
 			SkipItIf(helpers.DoesNotRunOn419OrLaterKernel, "with IPSec and externalTrafficPolicy=Local", func() {
 				deploymentManager.SetKubectl(kubectl)

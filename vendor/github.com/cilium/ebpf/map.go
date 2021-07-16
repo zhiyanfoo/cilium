@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +66,11 @@ type MapSpec struct {
 	// InnerMap is used as a template for ArrayOfMaps and HashOfMaps
 	InnerMap *MapSpec
 
+	// Extra trailing bytes found in the ELF map definition when using structs
+	// larger than libbpf's bpf_map_def. Must be empty before instantiating
+	// the MapSpec into a Map.
+	Extra bytes.Reader
+
 	// The BTF associated with this map.
 	BTF *btf.Map
 }
@@ -82,10 +88,30 @@ func (ms *MapSpec) Copy() *MapSpec {
 	}
 
 	cpy := *ms
+
 	cpy.Contents = make([]MapKV, len(ms.Contents))
 	copy(cpy.Contents, ms.Contents)
+
 	cpy.InnerMap = ms.InnerMap.Copy()
+
 	return &cpy
+}
+
+func (ms *MapSpec) clampPerfEventArraySize() error {
+	if ms.Type != PerfEventArray {
+		return nil
+	}
+
+	n, err := internal.PossibleCPUs()
+	if err != nil {
+		return fmt.Errorf("perf event array: %w", err)
+	}
+
+	if n := uint32(n); ms.MaxEntries > n {
+		ms.MaxEntries = n
+	}
+
+	return nil
 }
 
 // MapKV is used to initialize the contents of a Map.
@@ -214,7 +240,7 @@ func newMapWithOptions(spec *MapSpec, opts MapOptions, handles *handleCache) (_ 
 		// Nothing to do here
 
 	default:
-		return nil, fmt.Errorf("unsupported pin type %d", int(spec.Pinning))
+		return nil, fmt.Errorf("pin type %d: %w", int(spec.Pinning), ErrNotSupported)
 	}
 
 	var innerFd *internal.FD
@@ -261,10 +287,16 @@ func createMap(spec *MapSpec, inner *internal.FD, opts MapOptions, handles *hand
 
 	spec = spec.Copy()
 
+	// Kernels 4.13 through 5.4 used a struct bpf_map_def that contained
+	// additional 'inner_map_idx' and later 'numa_node' fields.
+	// In order to support loading these definitions, tolerate the presence of
+	// extra bytes, but require them to be zeroes.
+	if _, err := io.Copy(internal.DiscardZeroes{}, &spec.Extra); err != nil {
+		return nil, errors.New("Extra contains unhandled non-zero bytes, drain before creating map")
+	}
+
 	switch spec.Type {
-	case ArrayOfMaps:
-		fallthrough
-	case HashOfMaps:
+	case ArrayOfMaps, HashOfMaps:
 		if err := haveNestedMaps(); err != nil {
 			return nil, err
 		}
@@ -299,26 +331,36 @@ func createMap(spec *MapSpec, inner *internal.FD, opts MapOptions, handles *hand
 			return nil, fmt.Errorf("map create: %w", err)
 		}
 	}
+	if spec.Flags&unix.BPF_F_MMAPABLE > 0 {
+		if err := haveMmapableMaps(); err != nil {
+			return nil, fmt.Errorf("map create: %w", err)
+		}
+	}
+	if spec.Flags&unix.BPF_F_INNER_MAP > 0 {
+		if err := haveInnerMaps(); err != nil {
+			return nil, fmt.Errorf("map create: %w", err)
+		}
+	}
 
-	attr := bpfMapCreateAttr{
-		mapType:    spec.Type,
-		keySize:    spec.KeySize,
-		valueSize:  spec.ValueSize,
-		maxEntries: spec.MaxEntries,
-		flags:      spec.Flags,
-		numaNode:   spec.NumaNode,
+	attr := internal.BPFMapCreateAttr{
+		MapType:    uint32(spec.Type),
+		KeySize:    spec.KeySize,
+		ValueSize:  spec.ValueSize,
+		MaxEntries: spec.MaxEntries,
+		Flags:      spec.Flags,
+		NumaNode:   spec.NumaNode,
 	}
 
 	if inner != nil {
 		var err error
-		attr.innerMapFd, err = inner.Value()
+		attr.InnerMapFd, err = inner.Value()
 		if err != nil {
 			return nil, fmt.Errorf("map create: %w", err)
 		}
 	}
 
 	if haveObjName() == nil {
-		attr.mapName = newBPFObjName(spec.Name)
+		attr.MapName = internal.NewBPFObjName(spec.Name)
 	}
 
 	var btfDisabled bool
@@ -330,13 +372,13 @@ func createMap(spec *MapSpec, inner *internal.FD, opts MapOptions, handles *hand
 		}
 
 		if handle != nil {
-			attr.btfFd = uint32(handle.FD())
-			attr.btfKeyTypeID = btf.MapKey(spec.BTF).ID()
-			attr.btfValueTypeID = btf.MapValue(spec.BTF).ID()
+			attr.BTFFd = uint32(handle.FD())
+			attr.BTFKeyTypeID = uint32(btf.MapKey(spec.BTF).ID())
+			attr.BTFValueTypeID = uint32(btf.MapValue(spec.BTF).ID())
 		}
 	}
 
-	fd, err := bpfMapCreate(&attr)
+	fd, err := internal.BPFMapCreate(&attr)
 	if err != nil {
 		if errors.Is(err, unix.EPERM) {
 			return nil, fmt.Errorf("map create: RLIMIT_MEMLOCK may be too low: %w", err)
@@ -1185,7 +1227,7 @@ func MapGetNextID(startID MapID) (MapID, error) {
 //
 // Returns ErrNotExist, if there is no eBPF map with the given id.
 func NewMapFromID(id MapID) (*Map, error) {
-	fd, err := bpfObjGetFDByID(internal.BPF_MAP_GET_FD_BY_ID, uint32(id))
+	fd, err := internal.BPFObjGetFDByID(internal.BPF_MAP_GET_FD_BY_ID, uint32(id))
 	if err != nil {
 		return nil, err
 	}

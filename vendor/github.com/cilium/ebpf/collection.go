@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,10 @@ type CollectionOptions struct {
 type CollectionSpec struct {
 	Maps     map[string]*MapSpec
 	Programs map[string]*ProgramSpec
+
+	// ByteOrder specifies whether the ELF was compiled for
+	// big-endian or little-endian architectures.
+	ByteOrder binary.ByteOrder
 }
 
 // Copy returns a recursive copy of the spec.
@@ -34,8 +39,9 @@ func (cs *CollectionSpec) Copy() *CollectionSpec {
 	}
 
 	cpy := CollectionSpec{
-		Maps:     make(map[string]*MapSpec, len(cs.Maps)),
-		Programs: make(map[string]*ProgramSpec, len(cs.Programs)),
+		Maps:      make(map[string]*MapSpec, len(cs.Maps)),
+		Programs:  make(map[string]*ProgramSpec, len(cs.Programs)),
+		ByteOrder: cs.ByteOrder,
 	}
 
 	for name, spec := range cs.Maps {
@@ -90,8 +96,8 @@ func (cs *CollectionSpec) RewriteMaps(maps map[string]*Map) error {
 //
 // The constant must be defined like so in the C program:
 //
-//    static volatile const type foobar;
-//    static volatile const type foobar = default;
+//    volatile const type foobar;
+//    volatile const type foobar = default;
 //
 // Replacement values must be of the same length as the C sizeof(type).
 // If necessary, they are marshalled according to the same rules as
@@ -314,8 +320,6 @@ func (hc handleCache) close() {
 	for _, handle := range hc.btfHandles {
 		handle.Close()
 	}
-	hc.btfHandles = nil
-	hc.btfSpecs = nil
 }
 
 func lazyLoadCollection(coll *CollectionSpec, opts *CollectionOptions) (
@@ -387,7 +391,7 @@ func lazyLoadCollection(coll *CollectionSpec, opts *CollectionOptions) (
 		for i := range progSpec.Instructions {
 			ins := &progSpec.Instructions[i]
 
-			if ins.OpCode != asm.LoadImmOp(asm.DWord) || ins.Reference == "" {
+			if !ins.IsLoadFromMap() || ins.Reference == "" {
 				continue
 			}
 
@@ -399,7 +403,7 @@ func lazyLoadCollection(coll *CollectionSpec, opts *CollectionOptions) (
 
 			m, err := loadMap(ins.Reference)
 			if err != nil {
-				return nil, fmt.Errorf("program %s: %s", progName, err)
+				return nil, fmt.Errorf("program %s: %w", progName, err)
 			}
 
 			fd := m.FD()
@@ -561,7 +565,7 @@ func assignValues(to interface{}, valueOf func(reflect.Type, string) (reflect.Va
 			}
 
 			if err != nil {
-				return fmt.Errorf("field %s: %s", field.Name, err)
+				return fmt.Errorf("field %s: %w", field.Name, err)
 			}
 		}
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math"
 	"os"
 	"strings"
@@ -19,7 +20,7 @@ import (
 )
 
 // elfCode is a convenience to reduce the amount of arguments that have to
-// be passed around explicitly. You should treat it's contents as immutable.
+// be passed around explicitly. You should treat its contents as immutable.
 type elfCode struct {
 	*internal.SafeELFFile
 	sections map[elf.SectionIndex]*elfSection
@@ -159,7 +160,7 @@ func LoadCollectionSpecFromReader(rd io.ReaderAt) (*CollectionSpec, error) {
 			}
 
 			if target.Flags&elf.SHF_STRINGS > 0 {
-				return nil, fmt.Errorf("section %q: string %q is not stack allocated: %w", section.Name, rel.Name, ErrNotSupported)
+				return nil, fmt.Errorf("section %q: string is not stack allocated: %w", section.Name, ErrNotSupported)
 			}
 
 			target.references++
@@ -188,7 +189,7 @@ func LoadCollectionSpecFromReader(rd io.ReaderAt) (*CollectionSpec, error) {
 		return nil, fmt.Errorf("load programs: %w", err)
 	}
 
-	return &CollectionSpec{maps, progs}, nil
+	return &CollectionSpec{maps, progs, ec.ByteOrder}, nil
 }
 
 func loadLicense(sec *elf.Section) (string, error) {
@@ -374,16 +375,24 @@ func (ec *elfCode) relocateInstruction(ins *asm.Instruction, rel elf.Symbol) err
 		}
 
 	case dataSection:
+		var offset uint32
 		switch typ {
 		case elf.STT_SECTION:
 			if bind != elf.STB_LOCAL {
 				return fmt.Errorf("direct load: %s: unsupported relocation %s", name, bind)
 			}
 
+			// This is really a reference to a static symbol, which clang doesn't
+			// emit a symbol table entry for. Instead it encodes the offset in
+			// the instruction itself.
+			offset = uint32(uint64(ins.Constant))
+
 		case elf.STT_OBJECT:
 			if bind != elf.STB_GLOBAL {
 				return fmt.Errorf("direct load: %s: unsupported relocation %s", name, bind)
 			}
+
+			offset = uint32(rel.Value)
 
 		default:
 			return fmt.Errorf("incorrect relocation type %v for direct map load", typ)
@@ -394,10 +403,8 @@ func (ec *elfCode) relocateInstruction(ins *asm.Instruction, rel elf.Symbol) err
 		// it's not clear how to encode that into Instruction.
 		name = target.Name
 
-		// For some reason, clang encodes the offset of the symbol its
-		// section in the first basic BPF instruction, while the kernel
-		// expects it in the second one.
-		ins.Constant <<= 32
+		// The kernel expects the offset in the second basic BPF instruction.
+		ins.Constant = int64(uint64(offset) << 32)
 		ins.Src = asm.PseudoMapValue
 
 		// Mark the instruction as needing an update when creating the
@@ -491,39 +498,51 @@ func (ec *elfCode) loadMaps(maps map[string]*MapSpec) error {
 				return fmt.Errorf("section %s: missing symbol for map at offset %d", sec.Name, offset)
 			}
 
-			if maps[mapSym.Name] != nil {
+			mapName := mapSym.Name
+			if maps[mapName] != nil {
 				return fmt.Errorf("section %v: map %v already exists", sec.Name, mapSym)
 			}
 
 			lr := io.LimitReader(r, int64(size))
 
 			spec := MapSpec{
-				Name: SanitizeName(mapSym.Name, -1),
+				Name: SanitizeName(mapName, -1),
 			}
 			switch {
 			case binary.Read(lr, ec.ByteOrder, &spec.Type) != nil:
-				return fmt.Errorf("map %v: missing type", mapSym)
+				return fmt.Errorf("map %s: missing type", mapName)
 			case binary.Read(lr, ec.ByteOrder, &spec.KeySize) != nil:
-				return fmt.Errorf("map %v: missing key size", mapSym)
+				return fmt.Errorf("map %s: missing key size", mapName)
 			case binary.Read(lr, ec.ByteOrder, &spec.ValueSize) != nil:
-				return fmt.Errorf("map %v: missing value size", mapSym)
+				return fmt.Errorf("map %s: missing value size", mapName)
 			case binary.Read(lr, ec.ByteOrder, &spec.MaxEntries) != nil:
-				return fmt.Errorf("map %v: missing max entries", mapSym)
+				return fmt.Errorf("map %s: missing max entries", mapName)
 			case binary.Read(lr, ec.ByteOrder, &spec.Flags) != nil:
-				return fmt.Errorf("map %v: missing flags", mapSym)
+				return fmt.Errorf("map %s: missing flags", mapName)
 			}
 
-			if _, err := io.Copy(internal.DiscardZeroes{}, lr); err != nil {
-				return fmt.Errorf("map %v: unknown and non-zero fields in definition", mapSym)
+			extra, err := ioutil.ReadAll(lr)
+			if err != nil {
+				return fmt.Errorf("map %s: reading map tail: %w", mapName, err)
+			}
+			if len(extra) > 0 {
+				spec.Extra = *bytes.NewReader(extra)
 			}
 
-			maps[mapSym.Name] = &spec
+			if err := spec.clampPerfEventArraySize(); err != nil {
+				return fmt.Errorf("map %s: %w", mapName, err)
+			}
+
+			maps[mapName] = &spec
 		}
 	}
 
 	return nil
 }
 
+// loadBTFMaps iterates over all ELF sections marked as BTF map sections
+// (like .maps) and parses them into MapSpecs. Dump the .maps section and
+// any relocations with `readelf -x .maps -r <elf_file>`.
 func (ec *elfCode) loadBTFMaps(maps map[string]*MapSpec) error {
 	for _, sec := range ec.sections {
 		if sec.kind != btfMapSection {
@@ -534,27 +553,40 @@ func (ec *elfCode) loadBTFMaps(maps map[string]*MapSpec) error {
 			return fmt.Errorf("missing BTF")
 		}
 
-		_, err := io.Copy(internal.DiscardZeroes{}, bufio.NewReader(sec.Open()))
-		if err != nil {
-			return fmt.Errorf("section %v: initializing BTF map definitions: %w", sec.Name, internal.ErrNotSupported)
-		}
-
+		// Each section must appear as a DataSec in the ELF's BTF blob.
 		var ds btf.Datasec
 		if err := ec.btf.FindType(sec.Name, &ds); err != nil {
 			return fmt.Errorf("cannot find section '%s' in BTF: %w", sec.Name, err)
 		}
 
+		// Open a Reader to the ELF's raw section bytes so we can assert that all
+		// of them are zero on a per-map (per-Var) basis. For now, the section's
+		// sole purpose is to receive relocations, so all must be zero.
+		rs := sec.Open()
+
 		for _, vs := range ds.Vars {
+			// BPF maps are declared as and assigned to global variables,
+			// so iterate over each Var in the DataSec and validate their types.
 			v, ok := vs.Type.(*btf.Var)
 			if !ok {
 				return fmt.Errorf("section %v: unexpected type %s", sec.Name, vs.Type)
 			}
 			name := string(v.Name)
 
+			// The BTF metadata for each Var contains the full length of the map
+			// declaration, so read the corresponding amount of bytes from the ELF.
+			// This way, we can pinpoint which map declaration contains unexpected
+			// (and therefore unsupported) data.
+			_, err := io.Copy(internal.DiscardZeroes{}, io.LimitReader(rs, int64(vs.Size)))
+			if err != nil {
+				return fmt.Errorf("section %v: map %s: initializing BTF map definitions: %w", sec.Name, name, internal.ErrNotSupported)
+			}
+
 			if maps[name] != nil {
 				return fmt.Errorf("section %v: map %s already exists", sec.Name, name)
 			}
 
+			// Each Var representing a BTF map definition contains a Struct.
 			mapStruct, ok := v.Type.(*btf.Struct)
 			if !ok {
 				return fmt.Errorf("expected struct, got %s", v.Type)
@@ -565,7 +597,21 @@ func (ec *elfCode) loadBTFMaps(maps map[string]*MapSpec) error {
 				return fmt.Errorf("map %v: %w", name, err)
 			}
 
+			if err := mapSpec.clampPerfEventArraySize(); err != nil {
+				return fmt.Errorf("map %v: %w", name, err)
+			}
+
 			maps[name] = mapSpec
+		}
+
+		// Drain the ELF section reader to make sure all bytes are accounted for
+		// with BTF metadata.
+		i, err := io.Copy(ioutil.Discard, rs)
+		if err != nil {
+			return fmt.Errorf("section %v: unexpected error reading remainder of ELF section: %w", sec.Name, err)
+		}
+		if i > 0 {
+			return fmt.Errorf("section %v: %d unexpected remaining bytes in ELF section, invalid BTF?", sec.Name, i)
 		}
 	}
 
@@ -576,23 +622,24 @@ func (ec *elfCode) loadBTFMaps(maps map[string]*MapSpec) error {
 // a BTF map definition. The name and spec arguments will be copied to the
 // resulting MapSpec, and inner must be true on any resursive invocations.
 func mapSpecFromBTF(name string, def *btf.Struct, inner bool, spec *btf.Spec) (*MapSpec, error) {
-
 	var (
-		key, value                 btf.Type
-		keySize, valueSize         uint32
-		mapType, flags, maxEntries uint32
-		pinType                    PinType
-		innerMapSpec               *MapSpec
-		err                        error
+		key, value         btf.Type
+		keySize, valueSize uint32
+		mapType            MapType
+		flags, maxEntries  uint32
+		pinType            PinType
+		innerMapSpec       *MapSpec
+		err                error
 	)
 
 	for i, member := range def.Members {
 		switch member.Name {
 		case "type":
-			mapType, err = uintFromBTF(member.Type)
+			mt, err := uintFromBTF(member.Type)
 			if err != nil {
 				return nil, fmt.Errorf("can't get type: %w", err)
 			}
+			mapType = MapType(mt)
 
 		case "map_flags":
 			flags, err = uintFromBTF(member.Type)
@@ -702,7 +749,7 @@ func mapSpecFromBTF(name string, def *btf.Struct, inner bool, spec *btf.Spec) (*
 			case *btf.Struct:
 				// The values member pointing to an array of structs means we're expecting
 				// a map-in-map declaration.
-				if MapType(mapType) != ArrayOfMaps && MapType(mapType) != HashOfMaps {
+				if mapType != ArrayOfMaps && mapType != HashOfMaps {
 					return nil, errors.New("outer map needs to be an array or a hash of maps")
 				}
 				if inner {
@@ -847,6 +894,8 @@ func getProgType(sectionName string) (ProgramType, AttachType, uint32, string) {
 		"uretprobe/":            {Kprobe, AttachNone, 0},
 		"tracepoint/":           {TracePoint, AttachNone, 0},
 		"raw_tracepoint/":       {RawTracepoint, AttachNone, 0},
+		"raw_tp/":               {RawTracepoint, AttachNone, 0},
+		"tp_btf/":               {Tracing, AttachTraceRawTp, 0},
 		"xdp":                   {XDP, AttachNone, 0},
 		"perf_event":            {PerfEvent, AttachNone, 0},
 		"lwt_in":                {LWTIn, AttachNone, 0},
@@ -860,10 +909,14 @@ func getProgType(sectionName string) (ProgramType, AttachType, uint32, string) {
 		"lirc_mode2":            {LircMode2, AttachLircMode2, 0},
 		"flow_dissector":        {FlowDissector, AttachFlowDissector, 0},
 		"iter/":                 {Tracing, AttachTraceIter, 0},
+		"fentry/":               {Tracing, AttachTraceFEntry, 0},
+		"fmod_ret/":             {Tracing, AttachModifyReturn, 0},
+		"fexit/":                {Tracing, AttachTraceFExit, 0},
 		"fentry.s/":             {Tracing, AttachTraceFEntry, unix.BPF_F_SLEEPABLE},
 		"fmod_ret.s/":           {Tracing, AttachModifyReturn, unix.BPF_F_SLEEPABLE},
 		"fexit.s/":              {Tracing, AttachTraceFExit, unix.BPF_F_SLEEPABLE},
 		"sk_lookup/":            {SkLookup, AttachSkLookup, 0},
+		"freplace/":             {Extension, AttachNone, 0},
 		"lsm/":                  {LSM, AttachLSMMac, 0},
 		"lsm.s/":                {LSM, AttachLSMMac, unix.BPF_F_SLEEPABLE},
 
@@ -887,6 +940,11 @@ func getProgType(sectionName string) (ProgramType, AttachType, uint32, string) {
 		"cgroup/setsockopt":  {CGroupSockopt, AttachCGroupSetsockopt, 0},
 		"classifier":         {SchedCLS, AttachNone, 0},
 		"action":             {SchedACT, AttachNone, 0},
+
+		"cgroup/getsockname4": {CGroupSockAddr, AttachCgroupInet4GetSockname, 0},
+		"cgroup/getsockname6": {CGroupSockAddr, AttachCgroupInet6GetSockname, 0},
+		"cgroup/getpeername4": {CGroupSockAddr, AttachCgroupInet4GetPeername, 0},
+		"cgroup/getpeername6": {CGroupSockAddr, AttachCgroupInet6GetPeername, 0},
 	}
 
 	for prefix, t := range types {

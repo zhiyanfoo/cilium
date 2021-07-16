@@ -27,6 +27,9 @@ var (
 	ErrNoExtendedInfo = errors.New("no extended info")
 )
 
+// ID represents the unique ID of a BTF object.
+type ID uint32
+
 // Spec represents decoded BTF.
 type Spec struct {
 	rawTypes   []rawType
@@ -35,7 +38,7 @@ type Spec struct {
 	namedTypes map[string][]namedType
 	funcInfos  map[string]extInfo
 	lineInfos  map[string]extInfo
-	coreRelos  map[string]bpfCoreRelos
+	coreRelos  map[string]coreRelos
 	byteOrder  binary.ByteOrder
 }
 
@@ -377,7 +380,7 @@ func (s *Spec) marshal(opts marshalOpts) ([]byte, error) {
 	for _, raw := range s.rawTypes {
 		switch {
 		case opts.StripFuncLinkage && raw.Kind() == kindFunc:
-			raw.SetLinkage(linkageStatic)
+			raw.SetLinkage(StaticFunc)
 		}
 
 		if err := raw.Marshal(&buf, opts.ByteOrder); err != nil {
@@ -438,13 +441,13 @@ func (s *Spec) Program(name string, length uint64) (*Program, error) {
 
 	funcInfos, funcOK := s.funcInfos[name]
 	lineInfos, lineOK := s.lineInfos[name]
-	coreRelos, coreOK := s.coreRelos[name]
+	relos, coreOK := s.coreRelos[name]
 
 	if !funcOK && !lineOK && !coreOK {
 		return nil, fmt.Errorf("no extended BTF info for section %s", name)
 	}
 
-	return &Program{s, length, funcInfos, lineInfos, coreRelos}, nil
+	return &Program{s, length, funcInfos, lineInfos, relos}, nil
 }
 
 // Datasec returns the BTF required to create maps which represent data sections.
@@ -491,7 +494,8 @@ func (s *Spec) FindType(name string, typ Type) error {
 		return fmt.Errorf("type %s: %w", name, ErrNotFound)
 	}
 
-	value := reflect.Indirect(reflect.ValueOf(copyType(candidate)))
+	cpy, _ := copyType(candidate, nil)
+	value := reflect.Indirect(reflect.ValueOf(cpy))
 	reflect.Indirect(reflect.ValueOf(typ)).Set(value)
 	return nil
 }
@@ -541,6 +545,33 @@ func NewHandle(spec *Spec) (*Handle, error) {
 	}
 
 	return &Handle{fd}, nil
+}
+
+// NewHandleFromID returns the BTF handle for a given id.
+//
+// Returns ErrNotExist, if there is no BTF with the given id.
+//
+// Requires CAP_SYS_ADMIN.
+func NewHandleFromID(id ID) (*Handle, error) {
+	fd, err := internal.BPFObjGetFDByID(internal.BPF_BTF_GET_FD_BY_ID, uint32(id))
+	if err != nil {
+		return nil, fmt.Errorf("get BTF by id: %w", err)
+	}
+
+	return &Handle{fd}, nil
+}
+
+// HandleSpec returns the Spec that defined the BTF loaded into the kernel.
+//
+// This is a free function instead of a method to hide it from users
+// of package ebpf.
+func HandleSpec(s *Handle) (*Spec, error) {
+	info, err := newInfoFromFd(s.fd)
+	if err != nil {
+		return nil, fmt.Errorf("get BTF spec for handle: %w", err)
+	}
+
+	return info.BTF, nil
 }
 
 // Close destroys the handle.
@@ -606,7 +637,7 @@ type Program struct {
 	spec                 *Spec
 	length               uint64
 	funcInfos, lineInfos extInfo
-	coreRelos            bpfCoreRelos
+	coreRelos            coreRelos
 }
 
 // ProgramSpec returns the Spec needed for loading function and line infos into the kernel.
@@ -665,12 +696,11 @@ func ProgramLineInfos(s *Program) (recordSize uint32, bytes []byte, err error) {
 	return s.lineInfos.recordSize, bytes, nil
 }
 
-// ProgramRelocations returns the CO-RE relocations required to adjust the
-// program to the target.
+// ProgramFixups returns the changes required to adjust the program to the target.
 //
 // This is a free function instead of a method to hide it from users
 // of package ebpf.
-func ProgramRelocations(s *Program, target *Spec) (map[uint64]Relocation, error) {
+func ProgramFixups(s *Program, target *Spec) (COREFixups, error) {
 	if len(s.coreRelos) == 0 {
 		return nil, nil
 	}
@@ -779,7 +809,7 @@ var haveFuncLinkage = internal.FeatureTest("BTF func linkage", "5.6", func() err
 	types.Func.SetKind(kindFunc)
 	types.Func.SizeType = 1 // aka FuncProto
 	types.Func.NameOff = 1
-	types.Func.SetLinkage(linkageGlobal)
+	types.Func.SetLinkage(GlobalFunc)
 
 	btf := marshalBTF(&types, strings, internal.NativeEndian)
 

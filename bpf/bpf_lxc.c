@@ -40,6 +40,7 @@
 #include "lib/fib.h"
 #include "lib/nodeport.h"
 #include "lib/policy_log.h"
+#include "lib/egress_gateway.h"
 
 #if defined(ENABLE_ARP_PASSTHROUGH) && defined(ENABLE_ARP_RESPONDER)
 #error "Either ENABLE_ARP_PASSTHROUGH or ENABLE_ARP_RESPONDER can be defined"
@@ -799,27 +800,62 @@ ct_recreate4:
 
 #ifdef ENABLE_EGRESS_GATEWAY
 	{
-		struct egress_info *info;
 		struct endpoint_key key = {};
 
-		info = lookup_ip4_egress_endpoint(ip4->saddr, ip4->daddr);
-		if (!info)
+		struct ipv4_ct_tuple ct_key = {};
+		struct egress_ct *egress_ct;
+
+		struct egress_policy_key egress_key = {};
+		struct egress_policy *egress_policy;
+		__be32 gateway_ip;
+
+		ret = fill_egress_ct_key(&ct_key, ctx, ip4, l4_off);
+		if (ret < 0)
+			return ret;
+
+		/* First, check if the connection is already in the egress CT map */
+		egress_ct = lookup_ip4_egress_ct(&ct_key);
+		if (egress_ct) {
+			/* If there's an entry, extract the IP of the gateway node from
+			 * the egress_ct struct and forward the packet to the gateway
+			 */
+			gateway_ip = egress_ct->gateway_ip;
+
+			goto do_egress_gateway_redirect;
+		}
+
+		fill_egress_key(&egress_key, ip4->saddr, ip4->daddr);
+
+		/* Otherwise, lookup the (src IP, dst IP) tuple in the the egress policy map */
+		egress_policy = lookup_ip4_egress_policy(&egress_key);
+		if (!egress_policy)
 			goto skip_egress_gateway;
 
+		/* If there's a policy for the tuple, pick a random gateway from
+		 * the list of gateways
+		 */
+		gateway_ip = pick_egress_gateway(egress_policy);
+
+		/* And add an egress CT entry to pin the selected gateway node
+		 * for the connection
+		 */
+		update_egress_ct_entry(&ct_key, gateway_ip);
+
+do_egress_gateway_redirect:
 		/* Encap and redirect the packet to egress gateway node through a tunnel.
 		 * Even if the tunnel endpoint is on the same host, follow the same data
 		 * path to be consistent. In future, it can be optimized by directly
 		 * direct to external interface.
 		 */
-		ret = encap_and_redirect_lxc(ctx, info->tunnel_endpoint, encrypt_key,
-					     &key, SECLABEL, monitor);
+		ret = encap_and_redirect_lxc(ctx, gateway_ip, encrypt_key, &key,
+					     SECLABEL, monitor);
 		if (ret == IPSEC_ENDPOINT)
 			goto encrypt_to_stack;
 		else
 			return ret;
 	}
 skip_egress_gateway:
-#endif
+#endif /* ENABLE_EGRESS_GATEWAY */
 
 #ifdef TUNNEL_MODE
 # ifdef ENABLE_WIREGUARD

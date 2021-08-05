@@ -64,6 +64,10 @@
 # endif
 #endif
 
+#ifndef EGRESS_MAX_GATEWAY_NODES
+#define EGRESS_MAX_GATEWAY_NODES 64
+#endif
+
 /* XDP to SKB transferred meta data. */
 #define XFER_PKT_NO_SVC		1 /* Skip upper service handling. */
 
@@ -245,9 +249,20 @@ struct endpoint_info {
 	__u32		pad[4];
 };
 
-struct egress_info {
-	__u32 egress_ip;
-	__u32 tunnel_endpoint;
+struct egress_policy_key {
+	struct bpf_lpm_trie_key lpm_key;
+	__be32 saddr;
+	__be32 daddr;
+};
+
+struct egress_policy {
+	__u32 size;
+	__be32 egress_ip;
+	__be32 gateway_ips[EGRESS_MAX_GATEWAY_NODES];
+};
+
+struct egress_ct {
+	__be32 gateway_ip;
 };
 
 struct edt_id {

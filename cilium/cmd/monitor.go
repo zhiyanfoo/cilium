@@ -246,6 +246,7 @@ func runMonitor(args []string) {
 	// always wait connTimeout when retrying
 	for ; ; time.Sleep(connTimeout) {
 		conn, version, err := openMonitorSock(viper.GetString("monitor-socket"))
+		fmt.Println(viper.GetString("monitor-socket"))
 		if err != nil {
 			log.WithError(err).Error("Cannot open monitor socket")
 			return

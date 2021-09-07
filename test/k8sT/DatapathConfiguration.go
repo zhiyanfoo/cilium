@@ -81,6 +81,44 @@ var _ = Describe("K8sDatapathConfig", func() {
 	}
 
 	Context("MonitorAggregation", func() {
+		It("Checks that monitor aggregation set to none does not restrict notifications", func() {
+			deploymentManager.DeployCilium(map[string]string{
+				"bpf.monitorAggregation": "none",
+				"bpf.monitorInterval":    "0s", // should not effect monitor aggregation
+				"bpf.monitorFlags":       "syn",
+				// Need to disable the host firewall for now due to complexity issue.
+				// See #14552 for details.
+				"hostFirewall": "false",
+			}, DeployCiliumOptionsAndDNS)
+
+			monitorRes, monitorCancel, _ := monitorConnectivityAcrossNodes(kubectl)
+			defer monitorCancel()
+
+			var monitorOutput []byte
+
+			By("Checking the set of TCP notifications received matches expectations")
+			// | TCP Flags | Direction | Report? | Why?
+			// +===========+===========+=========+=====
+			// | SYN       |    ->     |    Y    | monitorFlags=SYN
+			// | SYN / ACK |    <-     |    Y    | monitorFlags=SYN
+			// | ACK       |    ->     |    N    | monitorFlags=(!ACK)
+			// | ACK       |    ...    |    N    | monitorFlags=(!ACK)
+			// | ACK       |    <-     |    N    | monitorFlags=(!ACK)
+			// | FIN       |    ->     |    Y    | monitorAggregation=medium
+			// | FIN / ACK |    <-     |    Y    | monitorAggregation=medium
+			// | ACK       |    ->     |    Y    | monitorAggregation=medium
+			egressPktCount := 3
+			ingressPktCount := 2
+			Eventually(func() bool {
+				monitorOutput = monitorRes.CombineOutput().Bytes()
+				GinkgoPrint("zhiyan1\n%s", monitorOutput)
+				return checkMonitorOutput(monitorOutput, egressPktCount, ingressPktCount)
+			}, helpers.HelperTimeout, time.Second).Should(BeTrue(), "Monitor log did not contain %d ingress and %d egress TCP notifications\n%s",
+				ingressPktCount, egressPktCount, monitorOutput)
+
+			helpers.WriteToReportFile(monitorOutput, monitorLog)
+		})
+
 		It("Checks that monitor aggregation restricts notifications", func() {
 			deploymentManager.DeployCilium(map[string]string{
 				"bpf.monitorAggregation": "medium",
@@ -130,6 +168,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 			ingressPktCount := 2
 			Eventually(func() bool {
 				monitorOutput = monitorRes.CombineOutput().Bytes()
+				GinkgoPrint("zhiyan2\n%s", monitorOutput)
 				return checkMonitorOutput(monitorOutput, egressPktCount, ingressPktCount)
 			}, helpers.HelperTimeout, time.Second).Should(BeTrue(), "Monitor log did not contain %d ingress and %d egress TCP notifications\n%s",
 				ingressPktCount, egressPktCount, monitorOutput)
@@ -163,6 +202,7 @@ var _ = Describe("K8sDatapathConfig", func() {
 			ingressPktCount := 3
 			Eventually(func() bool {
 				monitorOutput = monitorRes.CombineOutput().Bytes()
+				GinkgoPrint("zhiyan3\n%s", monitorOutput)
 				return checkMonitorOutput(monitorOutput, egressPktCount, ingressPktCount)
 			}, helpers.HelperTimeout, time.Second).Should(BeTrue(), "monitor aggregation did not result in correct number of TCP notifications\n%s", monitorOutput)
 			helpers.WriteToReportFile(monitorOutput, monitorLog)
